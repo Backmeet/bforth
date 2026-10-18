@@ -62,7 +62,7 @@ Note: `3 4 add` is not one singleton, `3` and `4` are operations them self which
 ```
 
 Also there exist some langauge commands to do output text, these are built into the language
-| Word | What it does | Example }
+| Word | What it does | Example |
 |---|---|---|
 | `dump` | Prints a number from the stack | `10 dump` |
 | `dumpc` | Prints a byte from stack as a char | `'A' dump` |
@@ -117,8 +117,8 @@ you specify it to be, so even droping needs to be carfull as for instance
 10 sized 8 drop
 // 7 bytes are still on stack and hence the program has a desynced stack 
 ```
-The compiler tries it best to see where a desync has happend and does warn you in --no-safe-slot mode, but you can still compile and run
-fyi in normal mode it just throws a error at you and stope compileing whenever the stack has too less or too many values 
+The compiler tries it best to see where a desync has happend and does warn you in --no-safe-slot mode, but you can still compile and run.
+FYI in normal mode it just throws a error at you and stope compileing whenever the stack has too less or too many values 
 
 ### Type aliases
 
@@ -374,9 +374,9 @@ item numbers [1] dump
 item numbers [1]= 77
 item numbers &[1]
 
-but in this format you can put raw sized N or unsigned or signed or a struct name
+// but in this format you can put raw sized N or unsigned or signed or a struct name
 
-```
+```bf
 
 Array storage is valid until the current function returns.
 
