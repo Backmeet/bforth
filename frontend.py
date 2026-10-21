@@ -6,6 +6,7 @@ Parser(tokens).parse()                  -> (tokens, funcs, extern_vars, extern_f
 """
 import re
 import sys
+import unicodedata
 from enum import IntEnum
 from typing import NamedTuple, NoReturn
 from pathlib import Path
@@ -27,6 +28,11 @@ class OP(IntEnum):
     PUSH = enum(True)
     STR = enum()
     ARRAY = enum()
+    ARRAY_UNINIT = enum()
+    ROT = enum()
+    ANTIROT = enum()
+    FUNC_REF = enum()
+    CALL_INDIRECT = enum()
     WORD = enum()
     ADD = enum()
     SUB = enum()
@@ -140,7 +146,8 @@ def warning(warn: str):
 
 LEX = re.compile(r"""
     (?P<ws>\s+|//[^\n]*)
-  | (?P<str>"(?:\\.|[^"\\])*")
+  | (?P<raw>r"[^"]*")
+  | (?P<str>"(?:\\[\s\S]|[^"\\])*")
   | (?P<chr>'(?:\\.|[^'\\])')
   | (?P<num>-?(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|\d[\d_]*))
   | (?P<call>[A-Za-z_]\w*)\(
@@ -149,10 +156,16 @@ LEX = re.compile(r"""
 """, re.X)
 
 ESC = {
+    "a": 7,
+    "b": 8,
+    "f": 12,
     "n": 10,
     "t": 9,
     "r": 13,
     "0": 0,
+    "v": 11,
+    "?": 63,
+    "e": 27,
     "\\": 92,
     "'": 39,
     '"': 34,
@@ -183,9 +196,46 @@ def decode(body: str, line: int) -> bytes:
 
         if c == "\\":
             i += 1
-            if i >= len(body) or body[i] not in ESC:
+            if i >= len(body):
                 error(f"Line {line}: bad escape sequence")
-            out.append(ESC[body[i]])
+            esc = body[i]
+            if esc == "\n":
+                pass
+            elif esc == "N" and i + 1 < len(body) and body[i + 1] == "{":
+                close = body.find("}", i + 2)
+                if close < 0:
+                    error(f"Line {line}: unterminated \\N Unicode escape")
+                try:
+                    out.extend(unicodedata.lookup(body[i + 2:close]).encode("utf-8"))
+                except KeyError:
+                    error(f"Line {line}: unknown Unicode character name")
+                i = close
+            elif esc in "01234567" and (esc != "0" or (i + 1 < len(body) and body[i + 1] in "01234567")):
+                digits = esc
+                while len(digits) < 3 and i + 1 < len(body) and body[i + 1] in "01234567":
+                    i += 1
+                    digits += body[i]
+                out.append(int(digits, 8) & 0xff)
+            elif esc in ESC:
+                out.append(ESC[esc])
+            elif esc == "x":
+                digits = body[i + 1:i + 3]
+                if len(digits) != 2 or not re.fullmatch(r"[0-9a-fA-F]{2}", digits):
+                    error(f"Line {line}: \\x escape needs exactly two hex digits")
+                out.append(int(digits, 16))
+                i += 2
+            elif esc in ("u", "U"):
+                width = 4 if esc == "u" else 8
+                digits = body[i + 1:i + 1 + width]
+                if len(digits) != width or not re.fullmatch(rf"[0-9a-fA-F]{{{width}}}", digits):
+                    error(f"Line {line}: \\{esc} escape needs {width} hex digits")
+                try:
+                    out.extend(chr(int(digits, 16)).encode("utf-8"))
+                except ValueError:
+                    error(f"Line {line}: invalid Unicode escape")
+                i += width
+            else:
+                error(f"Line {line}: bad escape sequence \\{esc}")
         else:
             out.extend(c.encode())
 
@@ -246,10 +296,12 @@ SIMPLE = {
     "write": OP.WRITE,
     "read": OP.READ,
     "ret": OP.RET,
+    "rot": OP.ROT,
+    "antirot": OP.ANTIROT,
 }
 
 KEYWORDS = set(SIMPLE) | {
-    "sized", "signed", "unsigned", "mutable", "while", "do",
+    "sized", "signed", "unsigned", "mutable", "while", "for", "do",
     "if", "elif", "else", "end",
     "set", "extern", "void", "variadic",
     "typedef", "struct", "from",
@@ -376,7 +428,7 @@ class Parser:
             result = self.token(kind, text, line, size, signed)
 
             if result is not None:
-                out.append(result)
+                out.extend(result if isinstance(result, list) else [result])
 
     def token(self, kind, text, line, size, signed):
         if kind == "num":
@@ -390,10 +442,18 @@ class Parser:
 
             return Token(OP.PUSH, data[0], 1, False, line)
 
-        if kind == "str":
+        if kind in ("str", "raw"):
+            if kind == "raw":
+                return Token(OP.STR, (text[2:-1].encode("utf-8"), False), 8, False, line)
             return Token(OP.STR, (decode(text[1:-1], line), False), 8, False, line)
 
         if kind == "punct":
+            if text == "(":
+                if not self.is_punct(")"):
+                    error(f"Line {line}: indirect calls use empty '()' syntax")
+                self.take()
+                return Token(OP.CALL_INDIRECT, None, size, signed, line)
+
             if text == "[":
                 return self.array(line, size, signed)
 
@@ -429,6 +489,20 @@ class Parser:
             return self.call_or_def(text, line, size, signed)
 
         if text in SIMPLE:
+            if text in ("rot", "antirot"):
+                group = 3
+                if self.is_word("with"):
+                    self.take()
+                    if not self.is_word("group"):
+                        error(f"Line {line}: expected 'group N' after {text} with")
+                    self.take()
+                    group_kind, group_text, group_line = self.take()
+                    if group_kind != "num":
+                        error(f"Line {group_line}: rotation group must be an integer literal")
+                    group = parse_num(group_text)
+                    if not 3 <= group <= 64:
+                        error(f"Line {group_line}: rotation group must be between 3 and 64")
+                return Token(SIMPLE[text], group, size, signed, line)
             if text == "ret":
                 self.saw_ret = True
 
@@ -514,6 +588,9 @@ class Parser:
 
                 return Token(OP.WHILE, (cond, body), size, signed, line)
 
+            case "for":
+                return self.for_loop(line, size, signed)
+
             case "if":
                 return self.parse_if(line, size, signed)
 
@@ -522,6 +599,9 @@ class Parser:
 
         if text in self.structs:
             return Token(OP.STRUCT_LIT, (text, self.parse_fields()), 8, False, line)
+
+        if text in self.funcs:
+            return Token(OP.FUNC_REF, text, 8, False, line)
 
         nxt = self.peek()
 
@@ -684,6 +764,43 @@ class Parser:
 
     # ---- control flow ----------------------------------------------------
 
+    def for_loop(self, line, size, signed):
+        """Lower both for syntaxes to an initialization and a while loop."""
+        init, pending = self.block({",", "do"})
+        self.no_pending(pending, line)
+        _, separator, sep_line = self.take()
+        if separator != ",":
+            error(f"Line {sep_line}: expected ',' after for initializer")
+
+        second, pending = self.block({",", "do"})
+        self.no_pending(pending, line)
+        _, separator, sep_line = self.take()
+
+        if separator == ",":
+            # C-like form: for init, cond, step do ... end
+            cond = second
+            step, pending = self.block({"do"})
+            self.no_pending(pending, line)
+            _, _, _ = self.take()
+        elif separator == "do":
+            # Counter form: for name start, end do ... end
+            if len(init) < 2 or init[0].type != OP.WORD:
+                error(f"Line {line}: counter form is 'for name start, end do'")
+            name = init[0].value
+            cond = [Token(OP.WORD, name, 0, False, line), *second,
+                    Token(OP.LT, None, size, signed, line)]
+            step = [Token(OP.WORD, name, 0, False, line),
+                    Token(OP.PUSH, 1, size, signed, line),
+                    Token(OP.ADD, None, size, signed, line),
+                    Token(OP.SET, name, size, signed, line)]
+        else:
+            error(f"Line {sep_line}: expected ',' or 'do' in for loop")
+
+        body, pending = self.block({"end"})
+        self.no_pending(pending, line)
+        self.take()
+        return [*init, Token(OP.WHILE, (cond, [*body, *step]), size, signed, line)]
+
     def parse_if(self, line, size, signed):
         branches = []
 
@@ -729,7 +846,7 @@ class Parser:
         result = None
         self.explicit_size = bool(pending and pending.size)
 
-        if kind in ("num", "chr", "str", "call", "word"):
+        if kind in ("num", "chr", "str", "raw", "call", "word"):
             result = self.token(
                 kind, text, line,
                 self.size_of(pending), bool(pending and pending.signed),
@@ -757,6 +874,39 @@ class Parser:
         A one element array literal needs a trailing comma: [x,]
         The old form [1 2 3] (only plain numbers) is still accepted."""
         elems = []
+
+        # Repeated-element literal: [:: count : value].  An omitted value
+        # initializes the array to zero, which is also the useful spelling
+        # [:: count:].  Expand this in the AST so every backend gets the same
+        # storage and initialization semantics as an ordinary literal.
+        if self.is_punct(":"):
+            self.take()
+            if not self.is_punct(":"):
+                error(f"Line {line}: expected '[:: count : value]'")
+            self.take()
+            count_kind, count_text, count_line = self.take()
+            if count_kind != "num":
+                error(f"Line {count_line}: array repeat count must be an integer literal")
+            count = parse_num(count_text)
+            if count < 0 or count > 1_000_000:
+                error(f"Line {count_line}: array repeat count must be between 0 and 1000000")
+            has_value_separator = self.is_punct(":")
+            if has_value_separator:
+                self.take()
+            if self.is_punct("]"):
+                self.take()
+                if not has_value_separator:
+                    return Token(OP.ARRAY_UNINIT, count, size, signed, line)
+                value = Token(OP.PUSH, 0, size, signed, line)
+            else:
+                if not has_value_separator:
+                    error(f"Line {count_line}: expected ']' or ':' after array repeat count")
+                value = self.operand()
+                if not self.is_punct("]"):
+                    error(f"Line {line}: expected ']' after repeated array value")
+                self.take()
+            return Token(OP.ARRAY, [[value] for _ in range(count)], size, signed, line)
+
         commas = 0
 
         while True:
@@ -914,6 +1064,14 @@ class Parser:
         return params
 
     def call_or_def(self, name, line, size, signed):
+        if name == "consteval":
+            expression, pending = self.block({")"})
+            self.no_pending(pending, line)
+            _, close, close_line = self.take()
+            if close != ")":
+                error(f"Line {close_line}: expected ')' after consteval expression")
+            return self.consteval(expression, line)
+
         if name == "sizeof":
             type_kind, type_name, type_line = self.take()
             close_kind, close, _ = self.take()
@@ -965,6 +1123,96 @@ class Parser:
                     break
 
         return Token(OP.CALL, (name, args), size, signed, line)
+
+    def consteval(self, expression: list[Token], line: int) -> Token:
+        """Fold a pure, literal-only expression while parsing the source."""
+        stack: list[Token] = []
+
+        def integer(token: Token) -> int:
+            if token.type != OP.PUSH:
+                error(f"Line {token.line}: consteval operator needs integer literals")
+            bits = token.size * 8
+            value = int(token.value) & ((1 << bits) - 1)
+            if token.signed and value & (1 << (bits - 1)):
+                value -= 1 << bits
+            return value
+
+        binary = {
+            OP.ADD, OP.SUB, OP.MUL, OP.DIV, OP.MOD,
+            OP.AND, OP.OR, OP.XOR, OP.SHL, OP.SHR,
+            OP.EQ, OP.NE, OP.LT, OP.GT, OP.LE, OP.GE,
+        }
+        for token in expression:
+            if token.type in (OP.PUSH, OP.STR):
+                stack.append(token)
+                continue
+            if token.type == OP.ARRAY:
+                packed = bytearray()
+                elem_size = token.size
+                for element in token.value:
+                    if len(element) != 1 or element[0].type != OP.PUSH:
+                        error(f"Line {line}: consteval arrays currently require integer literal elements")
+                    value = integer(element[0]) & ((1 << (elem_size * 8)) - 1)
+                    packed.extend(value.to_bytes(elem_size, "little", signed=False))
+                # A constant array is emitted as read-only static bytes.
+                stack.append(Token(OP.STR, (bytes(packed), False), 8, False, line))
+                continue
+            if token.type in (OP.NEG, OP.NOT):
+                if not stack:
+                    error(f"Line {line}: consteval expression has too few operands")
+                operand = integer(stack.pop())
+                bits = token.size * 8
+                mask = (1 << bits) - 1
+                value = -operand if token.type == OP.NEG else ~operand
+                value &= mask
+                if token.signed and value & (1 << (bits - 1)):
+                    value -= 1 << bits
+                stack.append(Token(OP.PUSH, value, token.size, token.signed, line))
+                continue
+            if token.type not in binary:
+                error(f"Line {line}: '{token.type.name.lower()}' is not allowed in consteval")
+            if len(stack) < 2:
+                error(f"Line {line}: consteval expression has too few operands")
+            b, a = integer(stack.pop()), integer(stack.pop())
+            bits = token.size * 8
+            mask = (1 << bits) - 1
+            signed_a, signed_b = a, b
+            unsigned_a, unsigned_b = a & mask, b & mask
+            if token.type == OP.ADD: value = a + b
+            elif token.type == OP.SUB: value = a - b
+            elif token.type == OP.MUL: value = a * b
+            elif token.type == OP.DIV:
+                if b == 0: error(f"Line {line}: division by zero in consteval")
+                if token.signed:
+                    value = (abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1)
+                else: value = unsigned_a // unsigned_b
+            elif token.type == OP.MOD:
+                if b == 0: error(f"Line {line}: division by zero in consteval")
+                if token.signed:
+                    q = (abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1)
+                    value = a - q * b
+                else: value = unsigned_a % unsigned_b
+            elif token.type == OP.AND: value = unsigned_a & unsigned_b
+            elif token.type == OP.OR: value = unsigned_a | unsigned_b
+            elif token.type == OP.XOR: value = unsigned_a ^ unsigned_b
+            elif token.type == OP.SHL: value = unsigned_a << (unsigned_b & (bits - 1))
+            elif token.type == OP.SHR: value = a >> (unsigned_b & (bits - 1)) if token.signed else unsigned_a >> (unsigned_b & (bits - 1))
+            elif token.type == OP.EQ: value = int(a == b)
+            elif token.type == OP.NE: value = int(a != b)
+            elif token.type == OP.LT: value = int(signed_a < signed_b) if token.signed else int(unsigned_a < unsigned_b)
+            elif token.type == OP.GT: value = int(signed_a > signed_b) if token.signed else int(unsigned_a > unsigned_b)
+            elif token.type == OP.LE: value = int(signed_a <= signed_b) if token.signed else int(unsigned_a <= unsigned_b)
+            else: value = int(signed_a >= signed_b) if token.signed else int(unsigned_a >= unsigned_b)
+            if token.type not in (OP.EQ, OP.NE, OP.LT, OP.GT, OP.LE, OP.GE):
+                value &= mask
+                if token.signed and value & (1 << (bits - 1)):
+                    value -= 1 << bits
+            stack.append(Token(OP.PUSH, value, token.size, token.signed, line))
+
+        if len(stack) != 1:
+            error(f"Line {line}: consteval expression must produce exactly one value")
+        return stack[0]
+
 
     def define(self, name, line, variadic=False):
         if name in self.extern_vars or name in self.extern_funcs:
@@ -1067,6 +1315,104 @@ class Parser:
 
 
 
+def optimize_tokens(tokens: list[Token], known_names=(), safe: bool = True) -> list[Token]:
+    """Propagate immutable integer locals through a parsed token tree.
+
+    This deliberately handles only literal integers and only variables that
+    are never assigned or addressed. It is a small, semantics-preserving
+    optimization suitable for the existing -O pipeline.
+    """
+    constants: dict[str, tuple[Token, int]] = {}
+    declaration_ids: set[int] = set()
+    assigned: set[str] = set()
+    addressed: set[str] = set()
+    declared: set[str] = set(known_names) | {"variadic_arr", "variadic_len"}
+
+    def visit_lists(items):
+        for seq in items:
+            if not isinstance(seq, list):
+                continue
+            for i, token in enumerate(seq):
+                if token.type == OP.WORD and i + 1 < len(seq) and seq[i + 1].type in (
+                    OP.PUSH, OP.STR, OP.ARRAY, OP.ARRAY_UNINIT, OP.CALL,
+                    OP.SIZEOF, OP.OFFSETOF, OP.ADDR, OP.FUNC_REF,
+                ):
+                    if token.value not in declared:
+                        if seq[i + 1].type == OP.PUSH:
+                            constants[token.value] = (seq[i + 1], token.size or 8)
+                            declaration_ids.add(id(token))
+                        declared.add(token.value)
+                elif token.type == OP.SET:
+                    assigned.add(token.value)
+                elif token.type == OP.ADDR:
+                    addressed.add(token.value)
+                elif token.type == OP.CALL:
+                    visit_lists(token.value[1])
+                elif token.type == OP.IF:
+                    for cond, _, body in token.value:
+                        visit_lists([cond, body])
+                elif token.type == OP.WHILE:
+                    visit_lists(token.value)
+                elif token.type in (OP.STRUCT_DECL, OP.STRUCT_LIT):
+                    fields = token.value[-1]
+                    visit_lists([toks for _, toks, _ in fields])
+
+    visit_lists([tokens])
+    constants = {name: value for name, value in constants.items()
+                 if name not in assigned and name not in addressed}
+
+    def transform(seq: list[Token]) -> list[Token]:
+        out = []
+        i = 0
+        while i < len(seq):
+            token = seq[i]
+            if id(token) in declaration_ids:
+                # Keep the declaration and its storage; only replace reads.
+                out.append(token)
+                i += 1
+                continue
+            if token.type == OP.WORD and token.value in constants:
+                value, declared_size = constants[token.value]
+                result_size = token.size or declared_size
+                # Keep the literal's signed value and signedness exactly as
+                # parsed. Masking it here changes signed narrow locals (e.g.
+                # `int x -5`) into a different value before code generation.
+                literal = Token(OP.PUSH, value.value, result_size,
+                                value.signed, token.line)
+                out.append(literal)
+            elif token.type == OP.CALL:
+                name, args = token.value
+                out.append(token._replace(value=(name, [transform(arg) for arg in args])))
+            elif token.type == OP.IF:
+                branches = [(transform(cond) if cond is not None else None, size, transform(body))
+                            for cond, size, body in token.value]
+                out.append(token._replace(value=branches))
+            elif token.type == OP.WHILE:
+                cond, body = token.value
+                out.append(token._replace(value=(transform(cond), transform(body))))
+            elif token.type == OP.ARRAY:
+                out.append(token._replace(value=[transform(element) for element in token.value]))
+            elif token.type == OP.INDEX:
+                operand, type_name = token.value
+                out.append(token._replace(value=(transform([operand])[0], type_name)))
+            elif token.type == OP.INDEX_SET:
+                operand, type_name, value = token.value
+                out.append(token._replace(value=(transform([operand])[0], type_name, transform([value])[0])))
+            elif token.type == OP.INDEX_ADDR:
+                operand, type_name = token.value
+                out.append(token._replace(value=(transform([operand])[0], type_name)))
+            elif token.type in (OP.STRUCT_DECL, OP.STRUCT_LIT):
+                value = token.value
+                fields = [(name, transform(toks), line) for name, toks, line in value[-1]]
+                out.append(token._replace(value=(*value[:-1], fields)))
+            else:
+                out.append(token)
+            i += 1
+        return out
+
+    return transform(tokens)
+
+
 def preprocess(
     path: Path,
     include_dirs: list[Path],
@@ -1108,15 +1454,90 @@ def preprocess(
     )
 
     def expand(line: str) -> str:
+        def expand_callable(name: str, params: list[str], replacement: str, source: str, end: int):
+            if end >= len(source) or source[end] != "(":
+                return None
+            depth = 0
+            quote = None
+            escaped = False
+            start = end + 1
+            pieces = []
+            arg_start = start
+            close = None
+            for pos in range(start, len(source)):
+                ch = source[pos]
+                if quote:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == quote:
+                        quote = None
+                    continue
+                if ch in "\"'":
+                    quote = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    if depth == 0:
+                        pieces.append(source[arg_start:pos].strip())
+                        close = pos
+                        break
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    pieces.append(source[arg_start:pos].strip())
+                    arg_start = pos + 1
+            if close is None:
+                error(f"unterminated invocation of macro '{name}'")
+            if len(pieces) == 1 and not pieces[0] and not params:
+                pieces = []
+            if len(pieces) != len(params):
+                error(f"macro '{name}' expects {len(params)} argument(s), got {len(pieces)}")
+            values = dict(zip(params, pieces))
+            expanded = pattern.sub(lambda m: values.get(m.group(), m.group()), replacement)
+            return expanded, close + 1
+
         def replace(match):
             token = match.group()
 
             if token[0] in "\"'/" or token[0].isdigit():
                 return token
 
-            return defines.get(token, token)
+            value = defines.get(token, token)
+            if isinstance(value, tuple):
+                invoked = expand_callable(token, value[0], value[1], line, match.end())
+                if invoked is not None:
+                    expansion, end = invoked
+                    return expansion + "\x00" + str(end)
+            return value
 
-        return pattern.sub(replace, line)
+        # Expand function-like invocations with balanced arguments, then object macros.
+        cursor = 0
+        out = []
+        while cursor < len(line):
+            match = pattern.match(line, cursor)
+            if not match:
+                out.append(line[cursor])
+                cursor += 1
+                continue
+            token = match.group()
+            if token[0] in "\"'/" or token[0].isdigit():
+                out.append(token)
+                cursor = match.end()
+                continue
+            value = defines.get(token)
+            if isinstance(value, tuple):
+                invocation = expand_callable(token, value[0], value[1], line, match.end())
+                if invocation is not None:
+                    expansion, cursor = invocation
+                    out.append(expand(expansion))
+                    continue
+                out.append(token)
+                cursor = match.end()
+                continue
+            out.append(str(value) if value is not None else token)
+            cursor = match.end()
+        return "".join(out)
 
     for line_number, line in enumerate(source.splitlines(keepends=True), 1):
         directive = re.match(r"^\s*#\s*(\w+)(.*)$", line)
@@ -1129,17 +1550,23 @@ def preprocess(
         argument = re.sub(r"\s*//.*$", "", argument).strip()
 
         if command == "define":
-            match = re.fullmatch(r"([A-Za-z_]\w*)(?:\s+(.*))?", argument)
+            match = re.fullmatch(r"([A-Za-z_]\w*)(?:\(([^)]*)\))?(?:\s+(.*))?", argument)
 
             if not match:
                 error(f"{path}:{line_number}: invalid #define")
 
-            name, value = match.groups()
+            name, params_text, value = match.groups()
 
             if name in defines:
                 warning(f"{path}:{line_number}: redefining '{name}'")
 
-            defines[name] = value if value is not None else ""
+            if params_text is None:
+                defines[name] = value if value is not None else ""
+            else:
+                params = [part.strip() for part in params_text.split(",")] if params_text.strip() else []
+                if any(not re.fullmatch(r"[A-Za-z_]\w*", item) for item in params) or len(set(params)) != len(params):
+                    error(f"{path}:{line_number}: invalid callable macro parameters")
+                defines[name] = (params, value if value is not None else "")
 
         elif command == "include":
             match = re.fullmatch(r'["<]([^">]+)[">]', argument)
@@ -1171,7 +1598,11 @@ def preprocess(
             )
 
         elif command == "pragma":
-            if argument != "once":
+            if argument == "requires_no_safe_slot":
+                output.append("// __bforth_requires_no_safe_slot__\n")
+            elif argument == "requires_safe_slot":
+                output.append("// __bforth_requires_safe_slot__\n")
+            elif argument != "once":
                 error(
                     f"{path}:{line_number}: "
                     f"unsupported #pragma '{argument}'"

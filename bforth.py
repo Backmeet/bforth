@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from frontend import Parser, error, lex, preprocess  # noqa: E402, dam you pyright
+from frontend import Parser, error, lex, optimize_tokens, preprocess  # noqa: E402, dam you pyright
 
 SAMPLE = r"""
 typedef char sized 8
@@ -98,7 +98,7 @@ def run_tool(command: list[str], what: str):
         error(f"{command[0]} failed with exit code {exc.returncode}")
 
 
-def build(target: str, text: str, output_path: Path):
+def build(target: str, text: str, output_path: Path, freestanding: bool = False):
     """Turn the generated text into an executable with the external tools."""
     suffix = ".ll" if target == "llvm" else ".asm"
     work = Path(tempfile.mkdtemp(prefix="bforth_"))
@@ -113,15 +113,44 @@ def build(target: str, text: str, output_path: Path):
             if compiler is None:
                 error("Required tool not found: clang (needed to compile the LLVM IR)")
 
-            run_tool([compiler, "-Wno-override-module", str(source_file), "-o", str(output_path)], "compile the LLVM IR")
+            command = [compiler, "-Wno-override-module", str(source_file), "-o", str(output_path)]
+            if freestanding:
+                command[1:1] = ["-ffreestanding", "-nostdlib", "-nodefaultlibs", "-nostartfiles"]
+                command.extend(["-Wl,-e,main"])
+            run_tool(command, "compile the LLVM IR")
         else:
             fmt = "win64" if target == "win" else "elf64"
             run_tool(["nasm", "-f", fmt, "-o", str(object_file), str(source_file)], "assemble")
-            run_tool(["gcc", str(object_file), "-o", str(output_path)], "link")
+            command = ["gcc", str(object_file), "-o", str(output_path)]
+            if freestanding:
+                command[1:1] = ["-ffreestanding", "-nostdlib", "-nodefaultlibs", "-nostartfiles"]
+                command.append("-Wl,-e,main")
+            run_tool(command, "link")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
     print(f"Built {output_path}")
+
+
+def emit_object(target: str, text: str, output_path: Path):
+    """Write a native object file without leaving intermediate assembly behind."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="bforth_obj_", dir=str(output_path.parent)))
+    suffix = ".ll" if target == "llvm" else ".asm"
+    source_file = work / ("prog" + suffix)
+    source_file.write_text(text, encoding="utf-8")
+    try:
+        if target == "llvm":
+            compiler = shutil.which("clang") or shutil.which("cc")
+            if compiler is None:
+                error("Required tool not found: clang (needed to compile LLVM IR)")
+            run_tool([compiler, "-Wno-override-module", "-c", str(source_file), "-o", str(output_path)], "compile the LLVM IR to an object")
+        else:
+            fmt = "win64" if target == "win" else "elf64"
+            run_tool(["nasm", "-f", fmt, "-o", str(output_path), str(source_file)], "assemble to an object")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print(f"Generated object {output_path}")
 
 
 def main(argv=None):
@@ -131,6 +160,10 @@ def main(argv=None):
     argp.add_argument("source", nargs="?", help="Input source file")
     argp.add_argument("-o", metavar="FILE", help="Output file")
     argp.add_argument("-s", action="store_true", help="Generate assembly / LLVM IR only")
+    argp.add_argument("-c", "--object", action="store_true",
+                      help="Generate an unlinked native .o object file (may contain unresolved externals)")
+    argp.add_argument("--freestanding", action="store_true",
+                      help="Link without startup files or default libraries (-ffreestanding -nostdlib)")
     argp.add_argument("-t", "--target", choices=sorted(TARGETS), default=None,
                       help="win | linux | llvm (default: the machine you run on)")
     argp.add_argument("-C", "--comments", action="store_true",
@@ -145,6 +178,9 @@ def main(argv=None):
     argp.add_argument("-D", dest="defines", action="append", default=[], metavar="NAME[=VALUE]",
                       help="Define a preprocessor constant")
     args = argp.parse_args(argv)
+
+    if args.s and args.object:
+        argp.error("-s and -c/--object cannot be used together")
 
     if args.source is None and args.o is not None:
         argp.error("an input source file is required when using -o")
@@ -175,7 +211,26 @@ def main(argv=None):
         except RecursionError:
             error("Preprocessor recursion limit exceeded")
 
+    requires_unsafe = "__bforth_requires_no_safe_slot__" in source
+    requires_safe = "__bforth_requires_safe_slot__" in source
+    if requires_unsafe and requires_safe:
+        error("source includes conflicting safe-slot requirements")
+    if requires_unsafe and not args.no_safe_slot:
+        error("this source requires --no-safe-slot (#pragma requires_no_safe_slot)")
+    if requires_safe and args.no_safe_slot:
+        error("this source requires safe slots (#pragma requires_safe_slot)")
+
     main_tokens, funcs, extern_vars, extern_funcs, structs, typedefs = Parser(lex(source)).parse()
+
+    if args.optimize:
+        known_names = set(extern_vars) | set(extern_funcs) | set(funcs)
+        main_tokens = optimize_tokens(main_tokens, known_names, safe=not args.no_safe_slot)
+        for name, function in list(funcs.items()):
+            if function is not None:
+                params = {parameter for parameter, _ in function.params}
+                funcs[name] = function._replace(body=optimize_tokens(
+                    function.body, known_names | params, safe=not args.no_safe_slot
+                ))
 
     # ---- stage 2: code generation ------------------------------------------------
     backend = load_backend(target)
@@ -207,12 +262,23 @@ def main(argv=None):
     else:
         output_path = Path("output" + (asm_suffix if args.s else exe_suffix))
 
+    if args.object:
+        if args.o:
+            object_path = Path(args.o)
+        elif source_path:
+            object_path = source_path.with_suffix(".o")
+        else:
+            object_path = Path("output.o")
+        emit_object(target, text, object_path)
+        return 0
+
     if args.s:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(text, encoding="utf-8")
         print(f"Generated {output_path}")
         return 0
 
-    build(target, text, output_path)
+    build(target, text, output_path, freestanding=args.freestanding)
     return 0
 
 

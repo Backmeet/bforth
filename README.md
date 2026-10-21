@@ -55,6 +55,11 @@ Note: `3 4 add` is not one singleton, `3` and `4` are operations them self which
 | `swap` | Swap the top two values | `1 2 swap` leaves `2 1` |
 | `over` | Copy the second value to the top | `1 2 over` leaves `1 2 1` |
 | `nip` | Remove the second value, keeping the top | `1 2 nip` leaves `2` |
+| `rot` | Reverse the top three values | `1 2 3 rot` leaves `3 2 1` |
+| `antirot` | Rotate the top three left | `1 2 3 antirot` leaves `2 3 1` |
+
+Use `rot with group N` or `antirot with group N` to rotate more than three
+values. Groups of four or more rotate one place right or left, respectively.
 
 ```bf
 65 dumpc
@@ -240,6 +245,21 @@ end
 
 prints `0` through `4`.
 
+`for` loops have a counter form and a three-part form:
+
+```bf
+for i 0, 5 do
+    i dump
+end
+
+for i 0, i 5 lt, i 1 add set i do
+    i dump
+end
+```
+
+The three-part form is `for init, condition, step do ... end`. A counter loop
+uses `for name start, end do ... end` and increments `name` by one.
+
 Keep the stack balanced inside the all conditions.
 bforth doesn't have `break` or `continue` (because I am lazy), so use the loop condition to decide when to stop.
 
@@ -268,6 +288,18 @@ square(9) dump              // 81
 ```
 
 Recurstion is supported.
+
+Writing a defined function's name without parentheses pushes its address.
+Follow it with an empty `()` to call that pointer; indirect calls take no
+arguments and produce a 64-bit result:
+
+```bf
+get_answer()
+    42 ret
+end
+
+get_answer () dump
+```
 
 If a function reaches the end without `ret`, it doesn't return a stack value. At top level, `ret` exits the program and uses the returned value as the exit code.
 
@@ -302,6 +334,10 @@ A string literal is stored as UTF-8 text ending in a NUL byte. Using it pushes i
 message "Hello from bforth"
 message dumps
 ```
+
+Prefix a string with `r` to keep backslashes literal. Escaped strings support
+the common C escapes (`\n`, `\t`, `\r`, `\0`, `\a`, `\b`, `\f`, `\v`,
+`\\`, quotes, octal bytes, `\xHH`, `\uHHHH`, and `\UHHHHHHHH`).
 
 String literals are read-only by default. Add `mutable` when you need to change the text:
 
@@ -347,6 +383,15 @@ Each element is 8 bytes by default. Put a size modifier before the array when yo
 ```bf
 sized 8 bytes [65, 66, 67, 0]
 sized 8 bytes [1] dump
+```
+
+Repeat one initializer with `[:: count : value]`; `[:: count :]` zero-fills,
+while `[:: count]` reserves uninitialized storage. A size modifier controls
+each element's width:
+
+```bf
+sized 8 zeroes [:: 1000 :]
+sized 8 tens [:: 1000 : 10]
 ```
 
 Indexing supports reads, writes, and addresses:
@@ -443,7 +488,9 @@ p read as point . x nip dump
 ```
 ## 9. Using C functions and variables
 
-`std.bf` gives you bindings for common C library functions and useful type aliases. If you need a symbol that isn't declared there, you can declare it with `extern`.
+`std.bf` gives you bindings for common C library functions and useful type aliases, including byte-sized `bool`. It also provides `string_copy`, `string_join`, `path_basename`, `path_dirname`, `path_join`, and `input(prompt)`; heap-returning helpers transfer ownership to the caller, who should call `free`. `input` reads a line from stdin. `keypressed(character)` reads and consumes one stdin character and compares it; this portable implementation blocks while waiting. `#define print printf` makes `print(...)` an alias for the variadic C `printf`.
+
+Use `-c` / `--object` to produce an unlinked native object file. `--freestanding` applies GCC/Clang's freestanding mode and disables startup files and default libraries when linking (`-ffreestanding -nostdlib -nodefaultlibs -nostartfiles`). Such a program must provide its own entry/runtime needs and any referenced external functions.
 
 ```bf
 extern malloc(sized 64 size)
@@ -484,20 +531,29 @@ Comments start with `//` and continue to the end of the line.
 6 7 mul dump
 ```
 
-There are three preprocessor directives:
+Preprocessor directives include:
 
 ```bf
 #define LIMIT 10
 #include "std.bf"
 #pragma once
+#define SQUARE(x) x x mul
 ```
 
-- `#define NAME value` replaces `NAME` with the rest of the line. Function-like macros aren't supported.
+- `#define NAME value` replaces `NAME` with the rest of the line. Callable macros accept comma-separated arguments, for example `#define SQUARE(x) x x mul`.
 - `#include "file"` reads another file. bforth looks beside the file doing the include first, then checks directories passed with `-I`.
 - `#pragma once` makes sure a file is only included once.
+- `#pragma requires_no_safe_slot` and `#pragma requires_safe_slot` require the matching compiler mode.
+
+`examples/windows.bf` provides common Win32 bindings; `examples/posix.bf`
+provides common POSIX bindings. Include the one for your target after `std.bf`.
 
 Use `-I` to add include directories and `-D` to define a value from the command line:
 
 ```sh
 python bforth.py program.bf -I include -D LIMIT=10 -o program.exe
+python bforth.py program.bf -c -t windows -o program.o
+python bforth.py program.bf --freestanding -o program.exe
 ```
+
+The example builder in `builds/build/build.bf` builds itself and places generated assembly under `builds/asm/` and executables under `builds/exes/`. Intermediate object files are written to `builds/tmp/` and removed after linking.

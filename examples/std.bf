@@ -10,7 +10,12 @@
 //    arguments; the first four go in registers, the rest on the stack.
 // =====================================================================
 
+#define MAX_PATH 260
+#define NULL 0
+#define INPUT_INITIAL_SIZE 64
+
 typedef byte sized 8
+typedef bool sized 8
 typedef char sized 8
 typedef short signed sized 16
 typedef ushort sized 16
@@ -18,6 +23,12 @@ typedef int signed sized 32
 typedef uint sized 32
 typedef long signed sized 64
 typedef ulong sized 64
+
+typedef ptr_t sized 64
+typedef size_t sized 64
+
+// `print(...)` is a direct alias for the C variadic printf function.
+#define print printf
 
 // ---- memory ----------------------------------------------------------
 extern malloc(sized 64 size)
@@ -61,6 +72,7 @@ extern void srand(sized 32 seed)
 extern long time(sized 64 out)
 extern getenv(sized 64 name)
 extern int system(sized 64 cmd)
+extern ptr_t getcwd(long buf, size_t size)
 
 // ---- I/O -------------------------------------------------------------
 extern variadic int printf(sized 64 fmt)
@@ -69,6 +81,7 @@ extern variadic int snprintf(sized 64 buf, sized 64 n, sized 64 fmt)
 extern int puts(sized 64 s)
 extern int putchar(sized 32 c)
 extern int getchar()
+extern int fflush(sized 64 file)
 extern fopen(sized 64 path, sized 64 mode)
 extern int fclose(sized 64 file)
 extern fgets(sized 64 buf, sized 32 n, sized 64 file)
@@ -82,6 +95,118 @@ extern int remove(sized 64 path)
 // 1 if the two C strings are equal (returns an int)
 streq(a, b)
     strcmp(a, b) int 0 int eq int ret
+end
+
+// ---- common string and path helpers ----------------------------------
+
+// Return a heap-owned copy of a string.
+string_copy(s)
+    strdup(s) ret
+end
+
+// Return a heap-owned concatenation of two strings. Caller frees the result.
+string_join(a, b)
+    size 0
+    strlen(a) strlen(b) add 1 add set size
+    result malloc(size)
+    if result 0 eq do 0 ret end
+    strcpy(result, a) ptr_t drop
+    strcat(result, b) ptr_t drop
+    result ret
+end
+
+// Return a pointer into `path` at the basename (accepts slash and backslash).
+path_basename(path)
+    slash strrchr(path, '/')
+    backslash strrchr(path, '\\')
+    if slash 0 eq do
+        if backslash 0 eq do path ret end
+        backslash 1 add ret
+    end
+    if backslash 0 eq do slash 1 add ret end
+    if slash backslash gt do slash 1 add ret end
+    backslash 1 add ret
+end
+
+// Allocate the parent directory string; caller frees it. No separator => ".".
+path_dirname(path)
+    slash strrchr(path, '/')
+    backslash strrchr(path, '\\')
+    separator 0
+    if slash 0 ne do slash set separator end
+    if backslash 0 ne do
+        if separator 0 eq backslash separator gt or do backslash set separator end
+    end
+    if separator 0 eq do strdup(".") ret end
+    length 0
+    separator path sub set length
+    if length 0 eq do 1 set length end
+    result calloc(length 1 add, 1)
+    if result 0 eq do 0 ret end
+    memcpy(result, path, length) drop
+    result ret
+end
+
+// Join paths with a forward slash. Caller frees the returned string.
+path_join(directory, name)
+    directory_length 0
+    strlen(directory) set directory_length
+    name_length 0
+    strlen(name) set name_length
+    separator 1
+    if directory_length 0 eq do 0 set separator end
+    result calloc(directory_length name_length add separator add 1 add, 1)
+    if result 0 eq do 0 ret end
+    strcpy(result, directory) ptr_t drop
+    if separator 0 ne do strcat(result, "/") ptr_t drop end
+    strcat(result, name) ptr_t drop
+    result ret
+end
+
+// Print a prompt and read one line into a growable heap string. The caller
+// owns the returned buffer and must call free. Capacity doubles as needed.
+input(ptr_t prompt)
+    printf("%s", prompt) drop
+    fflush(0) drop
+    capacity INPUT_INITIAL_SIZE
+    result calloc(capacity, 1)
+    if result 0 eq do 0 ret end
+    length 0
+    done 0
+    while done 0 eq do
+        character getchar()
+        if character 10 eq character 13 eq or do
+            1 set done
+        else
+            if character 0 lt do
+                1 set done
+            else
+                if length 1 add capacity ge do
+                    new_capacity 0
+                    capacity 2 mul set new_capacity
+                    resized 0
+                    realloc(result, new_capacity) set resized
+                    if resized 0 eq do
+                        free(result)
+                        0 ret
+                    end
+                    resized set result
+                    new_capacity set capacity
+                end
+                result [length: byte]= character
+                length 1 add set length
+            end
+        end
+    end
+    result [length: byte]= 0
+    result ptr_t ret
+end
+
+// Read and consume one character, returning true when it matches `character`.
+// This is intentionally the portable, blocking stdin version; platform-specific
+// non-blocking keyboard input belongs in a platform binding such as windows.bf.
+keypressed(char character)
+    getchar() int character int eq bool ret
 end
 
 // =====================================================================
@@ -234,3 +359,6 @@ setdarr(d, index, value)
     memcpy(ptrdarr(d, index), & value, d -> itemsize from darr nip) drop
     1 ret
 end
+
+
+

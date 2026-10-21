@@ -7,6 +7,7 @@
 // code that pops it:  `char 1 char 2 char add char dump`.
 // Expected output is written after each line.
 // exact-width program for --no-safe-slot
+#pragma requires_no_safe_slot
 typedef char sized 8
 typedef int signed sized 32
 typedef long signed sized 64

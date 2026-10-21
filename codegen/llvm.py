@@ -358,12 +358,12 @@ class LLVMCodegen(CodegenBase):
             elif name in self.extern_funcs:
                 error(f"Line {token.line}: External function '{name}' must be called with parentheses")
 
-            elif i < len(tokens) and tokens[i].type in (OP.PUSH, OP.STR, OP.ARRAY, OP.CALL, OP.SIZEOF, OP.OFFSETOF, OP.ADDR):
+            elif i < len(tokens) and tokens[i].type in (OP.PUSH, OP.STR, OP.ARRAY, OP.ARRAY_UNINIT, OP.CALL, OP.SIZEOF, OP.OFFSETOF, OP.ADDR, OP.FUNC_REF):
                 value = tokens[i]
                 i += 1
                 tsize = token.size or 8
 
-                if value.type == OP.ARRAY:
+                if value.type in (OP.ARRAY, OP.ARRAY_UNINIT):
                     value_size, value = 8, value._replace(size=tsize)
                 elif value.type == OP.STR:
                     value_size = 8
@@ -412,8 +412,39 @@ class LLVMCodegen(CodegenBase):
             self.globals.append(f'{name} = {kind} [{len(data) + 1} x i8] c"{body}"')
             self.push_val(self.p2i(name), 8)
 
+        elif t == OP.FUNC_REF:
+            self.push_val(self.p2i(f"@fn_{token.value}"), 8)
+
+        elif t == OP.CALL_INDIRECT:
+            pointer = self.i2p(self.pop_val(8))
+            result = self.tmp()
+            self.e(f"{result} = call i64 {pointer}()")
+            self.push_val(result, 8)
+
         elif t == OP.ARRAY:
             self.array(token)
+
+        elif t == OP.ARRAY_UNINIT:
+            total = (token.value * token.size + 7) // 8 * 8
+            base = self.stack_size
+            self.stack_size += total
+            self.max_stack = max(self.max_stack, self.stack_size)
+            self.push_val(self.p2i(self.stk(base)), 8)
+
+        elif t in (OP.ROT, OP.ANTIROT):
+            count = token.value
+            slot = self.slot(size)
+            self.need(count * slot, f"{t.name.lower()} needs {count} stack values")
+            base = self.stack_size - count * slot
+            values = [self.raw_load(base + i * slot, slot) for i in range(count)]
+            if t == OP.ROT and count == 3:
+                order = [2, 1, 0]
+            elif t == OP.ROT:
+                order = [*range(1, count), 0]
+            else:
+                order = [count - 1, *range(count - 1)]
+            for i, source in enumerate(order):
+                self.raw_store(base + i * slot, slot, values[source])
 
         elif t in ARITH or t in (OP.DIV, OP.MOD, OP.SHL, OP.SHR):
             self.arith(t, size, signed)

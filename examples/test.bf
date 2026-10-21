@@ -5,9 +5,12 @@
 // =====================================================================
 #include "std.bf"
 #include "std.bf"          // #pragma once: the second include is empty
+#pragma requires_safe_slot
 
 #define TEN 10
 #define MASK 0xFF
+#define DOUBLE(x) x x add
+#define COMPILE_TIME(x) consteval(x)
 #define CHECK check(results,
 
 struct point
@@ -56,6 +59,12 @@ end
 // ---- functions used by the tests --------------------------------------
 
 add3(a, b, c) a b c add add ret end
+answer() 42 ret end
+square(n) n n mul ret end
+constant_argument()
+    constant_value 7
+    square(constant_value) ret
+end
 
 fact(n)
     if n 2 lt do 1 ret end
@@ -115,6 +124,18 @@ char 200 dump
 "dumps ok" dumps
 
 // ---- literals ----------------------------------------------------------
+CHECK "callable macro", DOUBLE(9), 18)
+bool boolean_value 1
+CHECK "bool byte type", boolean_value, 1)
+checkstr(results, "string join", string_join("bf", "orth"), "bforth")
+checkstr(results, "path basename", path_basename(r"C:\\work/example.bf"), "example.bf")
+checkstr(results, "path dirname", path_dirname(r"C:\work\example.bf"), r"C:\work")
+checkstr(results, "path join", path_join("folder", "file.bf"), "folder/file.bf")
+print("printf macro: %d\n", 7) drop
+CHECK "consteval arithmetic", consteval(2 3 add 4 mul), 20)
+CHECK "consteval through macro", COMPILE_TIME(5 6 mul), 30)
+checkstr(results, "consteval string", consteval("folded"), "folded")
+CHECK "consteval array", consteval([7, 8, 9]) [2: long], 9)
 CHECK "dec", 42, 42)
 CHECK "hex lower", 0xff, 255)
 CHECK "hex mixed", 0xdeadBEEF, 3735928559)
@@ -208,6 +229,10 @@ CHECK "drop", 1 2 drop, 1)
 CHECK "swap", 1 2 swap sub, 1)
 CHECK "over", 1 2 over add add, 4)
 CHECK "nip", 1 2 nip, 2)
+CHECK "rot reverses three", 1 2 3 rot drop drop, 3)
+CHECK "antirot three", 1 2 3 antirot drop drop, 2)
+CHECK "rot group five", 1 2 3 4 5 rot with group 5 drop drop drop drop, 5)
+CHECK "antirot group five", 1 2 3 4 5 antirot with group 5 drop drop drop drop, 2)
 
 // ---- variables -------------------------------------------------------------
 v1 5
@@ -231,6 +256,16 @@ CHECK "bare &", 7 & read nip, 7)
 CHECK "bare & write", 1 & 9 write, 9)
 
 // ---- control flow ------------------------------------------------------------
+for_sum 0
+for for_counter 0, 5 do
+    for_sum for_counter add set for_sum
+end
+CHECK "counter for loop", for_sum, 10)
+for_c_sum 0
+for for_c_init 0, for_c_init 5 lt, for_c_init 1 add set for_c_init do
+    for_c_sum for_c_init add set for_c_sum
+end
+CHECK "three-part for loop", for_c_sum, 10)
 f1 0
 if 5 3 gt do 1 set f1 end
 CHECK "if true", f1, 1)
@@ -268,6 +303,10 @@ CHECK "while on byte", w7, 3)
 
 // ---- functions -----------------------------------------------------------------
 CHECK "call", add3(1, 2, 3), 6)
+CHECK "function pointer call", answer (), 42)
+answer_ptr answer
+CHECK "function pointer variable", answer_ptr () , 42)
+CHECK "constant propagation into call", constant_argument(), 49)
 CHECK "nested calls", add3(add3(1, 2, 3), add3(4, 5, 6), add3(7, 8, 9)), 45)
 CHECK "recursion", fact(5), 120)
 CHECK "recursion big", fact(10), 3628800)
@@ -339,6 +378,24 @@ checkstr(results, "legacy array", a5, "Hi")
 int a6 [1, -2, 3]
 CHECK "int array", a6 [1: int], int -2)
 CHECK "int array neighbour", a6 [2: int], 3)
+sized 8 zeros [:: 1000 :]
+CHECK "zero repeat array first", zeros sized 8 [0], 0)
+CHECK "zero repeat array last", zeros sized 8 [999], 0)
+sized 8 tens [:: 1000 : 10]
+CHECK "value repeat array first", tens sized 8 [0], 10)
+CHECK "value repeat array last", tens sized 8 [999], 10)
+sized 8 uninitialized [:: 32]
+CHECK "uninitialized repeat array pointer", uninitialized 0 ne, 1)
+CHECK "raw string backslash", strlen(r"a\nb"), 4)
+CHECK "raw string slash byte", r"a\nb" 1 add sized 8 read, 92)
+CHECK "C escape alert", "\a" sized 8 read, 7)
+CHECK "C escape backspace", "\b" sized 8 read, 8)
+CHECK "C escape form feed", "\f" sized 8 read, 12)
+CHECK "C escape vertical tab", "\v" sized 8 read, 11)
+CHECK "hex escape", "\x41" sized 8 read, 65)
+CHECK "unicode escape", "\u0042" sized 8 read, 66)
+CHECK "wide unicode escape", "\U00000043" sized 8 read, 67)
+CHECK "named unicode escape", "\N{LATIN SMALL LETTER D}" sized 8 read, 100)
 
 // ---- index operators -----------------------------------------------------------------
 a1 [0: long]= 0x1122

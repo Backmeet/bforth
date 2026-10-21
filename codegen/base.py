@@ -131,7 +131,7 @@ def rname(group, size: int) -> str:
 
 
 
-VALUE_OPS = (OP.PUSH, OP.STR, OP.ARRAY, OP.CALL, OP.SIZEOF, OP.OFFSETOF, OP.ADDR)
+VALUE_OPS = (OP.PUSH, OP.STR, OP.ARRAY, OP.ARRAY_UNINIT, OP.CALL, OP.SIZEOF, OP.OFFSETOF, OP.ADDR, OP.FUNC_REF)
 
 ARITH = {
     OP.ADD: "add",
@@ -328,6 +328,11 @@ OP_DESC = {
     OP.PUSH: lambda t: f"push the literal {t.value} [{t.size * 8}-bit]",
     OP.STR: lambda t: "push the address of a string literal",
     OP.ARRAY: lambda t: "array literal: evaluate each element, pack them in memory, push a pointer to them",
+    OP.ARRAY_UNINIT: lambda t: "uninitialized array literal: reserve storage and push a pointer",
+    OP.ROT: lambda t: f"rotate the top {t.value} stack values clockwise",
+    OP.ANTIROT: lambda t: f"rotate the top {t.value} stack values counterclockwise",
+    OP.FUNC_REF: lambda t: f"push the address of function '{t.value}'",
+    OP.CALL_INDIRECT: lambda t: "call the function whose address is on top of the stack",
     OP.ADD: _binary("add", "+"),
     OP.SUB: _binary("sub", "-"),
     OP.MUL: _binary("mul", "*"),
@@ -1215,7 +1220,7 @@ class Codegen(CodegenBase):
 
                 tsize = token.size or 8
 
-                if value.type == OP.ARRAY:
+                if value.type in (OP.ARRAY, OP.ARRAY_UNINIT):
                     value_size, value = 8, value._replace(size=tsize)
                 elif value.type == OP.STR:
                     value_size = 8
@@ -1266,8 +1271,60 @@ class Codegen(CodegenBase):
                 self.pushreg(reg)
                 release(reg)
 
+            case OP.FUNC_REF:
+                reg = self.getreg(8)
+                self.emit(f"lea {rn(reg)}, [rel fn_{token.value}]", why="function values are pointers to the generated function entry")
+                self.pushreg(reg)
+                release(reg)
+
+            case OP.CALL_INDIRECT:
+                target = self.pop64(8)
+                self.do_call(rn(target), [])
+                release(target)
+                if self.safe:
+                    self.emit("push rax", why="indirect calls return a 64-bit value")
+                    self.stack_size += 8
+                else:
+                    self.push_group(REGISTOR_GROUPS[0], 8)
+
             case OP.ARRAY:
                 self.array(token)
+
+            case OP.ARRAY_UNINIT:
+                total = (token.value * token.size + 7) // 8 * 8
+                if total:
+                    self.emit(f"sub rsp, {total}", why="reserve uninitialized array storage on the stack")
+                    self.stack_size += total
+                pointer = self.getreg(8)
+                self.emit(f"mov {rn(pointer)}, rsp", why="push a pointer to the first uninitialized array byte")
+                self.pushreg(pointer)
+                release(pointer)
+
+            case OP.ROT | OP.ANTIROT:
+                count = token.value
+                slot = self.slot(size)
+                self.need(count * slot, f"{token.type.name.lower()} needs {count} stack values")
+                temp = self.alloc_frame(count * slot)
+                # Snapshot the group because the stack representation is packed
+                # differently in safe-slot and exact-size modes.
+                for index in range(count):
+                    reg = self.getreg(8)
+                    group = REGISTOR_GROUP[reg]
+                    self.load_sized(group, f"[rsp+{index * slot}]", slot)
+                    self.store_sized(self.mem(temp + index * slot), group, slot)
+                    release(reg)
+                if token.type == OP.ROT and count == 3:
+                    order = [2, 1, 0]
+                elif token.type == OP.ROT:
+                    order = [*range(1, count), 0]
+                else:
+                    order = [count - 1, *range(count - 1)]
+                for index, source in enumerate(order):
+                    reg = self.getreg(8)
+                    group = REGISTOR_GROUP[reg]
+                    self.load_sized(group, self.mem(temp + source * slot), slot)
+                    self.store_sized(f"[rsp+{index * slot}]", group, slot)
+                    release(reg)
 
             case OP.ADD | OP.SUB | OP.AND | OP.OR | OP.XOR:
                 b = self.popreg(size)

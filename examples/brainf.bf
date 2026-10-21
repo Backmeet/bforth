@@ -7,7 +7,7 @@
 #include "std.bf"
 
 // run one Brainfuck program
-bfrun(code)
+bfrun(ptr_t code)
     tape calloc(30000, 1)
     ptr 0                       // tape position
     pc 0                        // position in the program
@@ -69,15 +69,7 @@ bfrun(code)
     free(tape)
 end
 
-"-- 8 * 8 + 1 = 65 = A --" dumps
-bfrun("++++++++[>++++++++<-]>+.>++++++++++.")
+to_run input(">>")
+bfrun(to_run)
+free(to_run)
 
-"-- hello world --" dumps
-bfrun("++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.")
-
-"-- hello world, another way --" dumps
-bfrun("++++++++++[>+++++++>++++++++++>+++>+<<<<-]>++.>+.+++++++..+++.>++.<<+++++++++++++++.>.+++.------.--------.>+.>.")
-
-"-- 5 squared, printed as digits --" dumps
-// 5 * 5 = 25: cell 2 becomes 50 ('2'), 3 more gives 53 ('5')
-bfrun("+++++[>+++++<-]>[>++<-]>.+++.>++++++++++.")
